@@ -4,7 +4,6 @@ import requests
 import re
 import concurrent.futures
 import time
-import os
 
 app = Flask(__name__)
 
@@ -16,59 +15,32 @@ HEADERS = {
 
 def extract_card(soup, label):
     """Helper to extract data from card elements"""
-    try:
-        for div in soup.select(".hrcd-cardbody"):
-            span = div.find("span")
-            if span and label.lower() in span.text.lower():
-                p_tag = div.find("p")
-                return p_tag.get_text(strip=True) if p_tag else ""
-    except:
-        pass
+    for div in soup.select(".hrcd-cardbody"):
+        span = div.find("span")
+        if span and label.lower() in span.text.lower():
+            return div.find("p").get_text(strip=True)
     return ""
 
 def extract_from_section(soup, header_text, keys):
     """Helper to extract data from section elements"""
+    section = soup.find("h3", string=lambda s: s and header_text.lower() in s.lower())
+    section_card = section.find_parent("div", class_="hrc-details-card") if section else None
     result = {}
-    try:
-        section = soup.find("h3", string=lambda s: s and header_text.lower() in s.lower())
-        if not section:
-            return result
-            
-        section_card = section.find_parent("div", class_="hrc-details-card")
-        if not section_card:
-            return result
-            
-        for key in keys:
-            span = section_card.find("span", string=lambda s: s and key in s)
-            if span:
-                val = span.find_next("p")
-                result[key.lower().replace(" ", "_")] = val.get_text(strip=True) if val else ""
-    except:
-        pass
+    for key in keys:
+        span = section_card.find("span", string=lambda s: s and key in s) if section_card else None
+        if span:
+            val = span.find_next("p")
+            result[key.lower().replace(" ", "_")] = val.get_text(strip=True) if val else ""
     return result
 
 def fetch_rc_details(rc):
     """Fetch RC details from vahanx.in"""
     try:
         url = f"https://vahanx.in/rc-search/{rc}"
-        
-        # Add retry logic
-        for attempt in range(2):
-            try:
-                response = requests.get(url, headers=HEADERS, timeout=15)
-                response.raise_for_status()
-                break
-            except requests.exceptions.Timeout:
-                if attempt == 1:
-                    return {"error": "Request timeout"}
-                time.sleep(1)
-        
+        response = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Safe extraction
-        h1_tag = soup.find("h1")
-        registration_number = h1_tag.text.strip() if h1_tag else rc
-        
+        registration_number = soup.find("h1").text.strip()
         modal_name = extract_card(soup, "Modal Name")
         owner_name = extract_card(soup, "Owner Name")
         code = extract_card(soup, "Code")
@@ -86,11 +58,7 @@ def fetch_rc_details(rc):
         ])
 
         insurance_expired_box = soup.select_one(".insurance-alert-box.expired .title")
-        expired_days = None
-        if insurance_expired_box and insurance_expired_box.text:
-            match = re.search(r"(\d+)", insurance_expired_box.text)
-            expired_days = int(match.group(1)) if match else None
-            
+        expired_days = int(re.search(r"(\d+)", insurance_expired_box.text).group(1)) if insurance_expired_box else None
         insurance = extract_from_section(soup, "Insurance Information", ["Insurance Expiry"])
         
         insurance_info = {
@@ -146,7 +114,7 @@ def fetch_rc_details(rc):
             }
         }
     except Exception as e:
-        return {"error": f"Failed to fetch RC details: {str(e)[:100]}"}
+        return {"error": f"Failed to fetch RC details: {str(e)}"}
 
 def fetch_challan_details(rc):
     """Fetch challan details from external API"""
@@ -158,18 +126,22 @@ def fetch_challan_details(rc):
             "Accept": "application/json"
         }
         
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         
         if response.status_code == 200:
             data = response.json()
             
+            # Extract challans from nested structure
             challans_list = []
+            
             if isinstance(data, dict) and 'data' in data:
                 inner_data = data['data']
                 
                 if isinstance(inner_data, dict) and 'data' in inner_data:
+                    # Structure: data -> data -> data -> array
                     challans_list = inner_data['data']
                 elif isinstance(inner_data, list):
+                    # Alternative: data -> data -> array
                     challans_list = inner_data
             
             # Calculate total amount
@@ -179,6 +151,7 @@ def fetch_challan_details(rc):
                     if isinstance(challan, dict):
                         amount_value = 0
                         
+                        # Check amount in different possible locations
                         if 'amount' in challan:
                             if isinstance(challan['amount'], dict) and 'total' in challan['amount']:
                                 total_val = challan['amount']['total']
@@ -231,24 +204,20 @@ def fetch_challan_details(rc):
 def get_vehicle_info():
     rc = request.args.get("rc")
     if not rc:
-        return jsonify({"success": False, "error": "Missing rc parameter"}), 400
+        return jsonify({"error": "Missing rc parameter"}), 400
 
-    # Validate RC format
-    if not re.match(r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}$', rc, re.IGNORECASE):
-        return jsonify({"success": False, "error": "Invalid RC number format. Example: MH02AB1234"}), 400
-    
     try:
-        # Sequential execution instead of parallel (simpler, less error prone)
-        rc_data = fetch_rc_details(rc)
-        challan_data = fetch_challan_details(rc)
+        # Fetch both APIs in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            rc_future = executor.submit(fetch_rc_details, rc)
+            challan_future = executor.submit(fetch_challan_details, rc)
+            
+            rc_data = rc_future.result()
+            challan_data = challan_future.result()
 
         # Check for RC data error
         if "error" in rc_data and not rc_data.get("registration_number"):
-            return jsonify({
-                "success": False, 
-                "error": rc_data["error"],
-                "challan_info": challan_data
-            }), 200
+            return jsonify({"success": False, "error": rc_data["error"]}), 500
 
         # Combine responses
         combined_data = {
@@ -261,7 +230,7 @@ def get_vehicle_info():
         return jsonify(combined_data)
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)[:100]}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/challan-info", methods=["GET"])
 def get_challan_info_only():
@@ -269,23 +238,11 @@ def get_challan_info_only():
     if not rc:
         return jsonify({"error": "Missing rc parameter"}), 400
     
-    # Validate RC format
-    if not re.match(r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}$', rc, re.IGNORECASE):
-        return jsonify({"error": "Invalid RC number format. Example: MH02AB1234"}), 400
-    
     try:
         challan_data = fetch_challan_details(rc)
         return jsonify(challan_data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-@app.route("/api/test", methods=["GET"])
-def test():
-    return jsonify({
-        "status": "active",
-        "message": "Vehicle API is running",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-    })
 
 @app.route("/", methods=["GET"])
 def home():
@@ -294,13 +251,9 @@ def home():
         "version": "1.0.0",
         "endpoints": {
             "/api/vehicle-info?rc=<number>": "Get vehicle RC details with challan info",
-            "/api/challan-info?rc=<number>": "Get only challan information",
-            "/api/test": "Health check endpoint"
-        },
-        "example": "https://" + request.host + "/api/vehicle-info?rc=MH02AB1234"
+            "/api/challan-info?rc=<number>": "Get only challan information"
+        }
     })
 
-# Vercel requires this
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(port=8888, debug=False)
