@@ -2,22 +2,19 @@ from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
 import requests
 import re
-import asyncio
-import httpx
-from functools import wraps
+import concurrent.futures
+import time
 
 app = Flask(__name__)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
     "Referer": "https://vahanx.in/",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br"
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
-# ---------- Helper functions for RC info ----------
 def extract_card(soup, label):
-    """Extract value from card by label"""
+    """Helper to extract data from card elements"""
     for div in soup.select(".hrcd-cardbody"):
         span = div.find("span")
         if span and label.lower() in span.text.lower():
@@ -25,7 +22,7 @@ def extract_card(soup, label):
     return ""
 
 def extract_from_section(soup, header_text, keys):
-    """Extract data from a specific section"""
+    """Helper to extract data from section elements"""
     section = soup.find("h3", string=lambda s: s and header_text.lower() in s.lower())
     section_card = section.find_parent("div", class_="hrc-details-card") if section else None
     result = {}
@@ -36,13 +33,8 @@ def extract_from_section(soup, header_text, keys):
             result[key.lower().replace(" ", "_")] = val.get_text(strip=True) if val else ""
     return result
 
-# ---------- RC Info Endpoint ----------
-@app.route("/api/vehicle-info", methods=["GET"])
-def get_vehicle_info():
-    rc = request.args.get("rc")
-    if not rc:
-        return jsonify({"error": "Missing rc parameter"}), 400
-
+def fetch_rc_details(rc):
+    """Fetch RC details from vahanx.in"""
     try:
         url = f"https://vahanx.in/rc-search/{rc}"
         response = requests.get(url, headers=HEADERS, timeout=10)
@@ -67,10 +59,11 @@ def get_vehicle_info():
 
         insurance_expired_box = soup.select_one(".insurance-alert-box.expired .title")
         expired_days = int(re.search(r"(\d+)", insurance_expired_box.text).group(1)) if insurance_expired_box else None
-        insurance_data = extract_from_section(soup, "Insurance Information", ["Insurance Expiry"])
-        insurance = {
-            "status": "Expired" if insurance_expired_box else "Active",
-            "expiry_date": insurance_data.get("insurance_expiry", ""),
+        insurance = extract_from_section(soup, "Insurance Information", ["Insurance Expiry"])
+        
+        insurance_info = {
+            "status": "Expired" if expired_days else "Active",
+            "expiry_date": insurance.get("insurance_expiry", ""),
             "expired_days_ago": expired_days
         }
 
@@ -82,7 +75,7 @@ def get_vehicle_info():
             "Financer Name", "Cubic Capacity", "Seating Capacity", "Permit Type", "Blacklist Status", "NOC Details"
         ])
 
-        data = {
+        return {
             "registration_number": registration_number,
             "modal_name": modal_name,
             "owner_name": owner_name,
@@ -103,7 +96,7 @@ def get_vehicle_info():
                 "fuel_type": vehicle.get("fuel_type", ""),
                 "fuel_norms": vehicle.get("fuel_norms", "")
             },
-            "insurance": insurance,
+            "insurance": insurance_info,
             "validity": {
                 "registration_date": validity.get("registration_date", ""),
                 "vehicle_age": validity.get("vehicle_age", ""),
@@ -120,167 +113,147 @@ def get_vehicle_info():
                 "noc": other.get("noc_details", "")
             }
         }
+    except Exception as e:
+        return {"error": f"Failed to fetch RC details: {str(e)}"}
 
-        return jsonify(data)
+def fetch_challan_details(rc):
+    """Fetch challan details from external API"""
+    try:
+        url = f"https://challan-ecru.vercel.app/api/challan?vehicle_number={rc}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36",
+            "Accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Extract challans from nested structure
+            challans_list = []
+            
+            if isinstance(data, dict) and 'data' in data:
+                inner_data = data['data']
+                
+                if isinstance(inner_data, dict) and 'data' in inner_data:
+                    # Structure: data -> data -> data -> array
+                    challans_list = inner_data['data']
+                elif isinstance(inner_data, list):
+                    # Alternative: data -> data -> array
+                    challans_list = inner_data
+            
+            # Calculate total amount
+            total_amount = 0
+            if isinstance(challans_list, list) and challans_list:
+                for challan in challans_list:
+                    if isinstance(challan, dict):
+                        amount_value = 0
+                        
+                        # Check amount in different possible locations
+                        if 'amount' in challan:
+                            if isinstance(challan['amount'], dict) and 'total' in challan['amount']:
+                                total_val = challan['amount']['total']
+                                try:
+                                    amount_value = float(str(total_val).replace(',', ''))
+                                except:
+                                    pass
+                            elif isinstance(challan['amount'], (int, float, str)):
+                                try:
+                                    if isinstance(challan['amount'], str):
+                                        amount_value = float(challan['amount'].replace(',', '').replace('₹', '').strip())
+                                    else:
+                                        amount_value = float(challan['amount'])
+                                except:
+                                    pass
+                        
+                        if amount_value == 0 and 'violations' in challan:
+                            if isinstance(challan['violations'], dict) and 'amount' in challan['violations']:
+                                viol_amount = challan['violations']['amount']
+                                try:
+                                    amount_value = float(str(viol_amount).replace(',', ''))
+                                except:
+                                    pass
+                        
+                        total_amount += amount_value
+            
+            return {
+                "total_challans": len(challans_list) if isinstance(challans_list, list) else 0,
+                "total_amount": total_amount,
+                "challans": challans_list if isinstance(challans_list, list) else [],
+                "status": "success"
+            }
+        else:
+            return {
+                "total_challans": 0,
+                "total_amount": 0,
+                "challans": [],
+                "status": "api_error"
+            }
+            
+    except Exception:
+        return {
+            "total_challans": 0,
+            "total_amount": 0,
+            "challans": [],
+            "status": "error"
+        }
 
+@app.route("/api/vehicle-info", methods=["GET"])
+def get_vehicle_info():
+    rc = request.args.get("rc")
+    if not rc:
+        return jsonify({"error": "Missing rc parameter"}), 400
+
+    try:
+        # Fetch both APIs in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            rc_future = executor.submit(fetch_rc_details, rc)
+            challan_future = executor.submit(fetch_challan_details, rc)
+            
+            rc_data = rc_future.result()
+            challan_data = challan_future.result()
+
+        # Check for RC data error
+        if "error" in rc_data and not rc_data.get("registration_number"):
+            return jsonify({"success": False, "error": rc_data["error"]}), 500
+
+        # Combine responses
+        combined_data = {
+            "success": True,
+            "vehicle_info": rc_data,
+            "challan_info": challan_data,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        }
+
+        return jsonify(combined_data)
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/challan-info", methods=["GET"])
+def get_challan_info_only():
+    rc = request.args.get("rc")
+    if not rc:
+        return jsonify({"error": "Missing rc parameter"}), 400
+    
+    try:
+        challan_data = fetch_challan_details(rc)
+        return jsonify(challan_data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- DL Extraction ----------
-def extract_dl_data(html: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-
-    def get_value(label: str):
-        el = soup.find("span", string=lambda x: x and x.strip().lower() == label.lower())
-        if el:
-            p_tag = el.find_next("p")
-            return p_tag.get_text(strip=True) if p_tag else None
-        return None
-
-    return {
-        "license_number": get_value("License Number"),
-        "holder_name": get_value("Holder Name"),
-        "father_name": get_value("Father's Name"),
-        "dob": get_value("Date of Birth"),
-        "holder_age": get_value("Holder Age"),
-        "citizen": get_value("Citizen"),
-        "gender": get_value("Gender"),
-        "status": get_value("Current Status"),
-        "date_of_issue": get_value("Date of Issue"),
-        "last_transaction_at": get_value("Last Transaction At"),
-        "validity": {
-            "non_transport": {
-                "from": (get_value("Non-Transport Validity") or "").split(" to ")[0],
-                "to": (get_value("Non-Transport Validity") or "").split(" to ")[-1]
-            },
-            "transport": {
-                "from": (get_value("Transport Validity") or "").split(" to ")[0],
-                "to": (get_value("Transport Validity") or "").split(" to ")[-1]
-            }
-        },
-        "class_of_vehicle": [
-            li.get_text(strip=True) for li in soup.select(".hrc-details-card ul li")
-        ]
-    }
-
-# ---------- Challan Extraction ----------
-def extract_challan_data(html: str, vehicle_number: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-
-    detail_map = [
-        "model_name", "owner_name", "rto_code", "rto_city",
-        "phone", "website", "address"
-    ]
-    details = soup.select(".hrcd-cardbody")
-    vehicle_info = {}
-    for idx, key in enumerate(detail_map):
-        try:
-            vehicle_info[key] = details[idx].get_text(strip=True)
-        except:
-            vehicle_info[key] = None
-
-    challans = []
-    challan_cards = soup.select(".echallan-card")
-    for idx, card in enumerate(challan_cards, start=1):
-        challan_id_raw = card.select_one(".echallan-card-header p").get_text(strip=True)
-        challan_id = challan_id_raw.replace("#", "").strip()
-        status = card.select_one(".echallan-card-header span").get_text(strip=True)
-
-        ecb_lists = card.select(".ecb-list")
-        challan_date = None
-        offence = "Unknown"
-        location = None
-
-        for ecb in ecb_lists:
-            label = ecb.select_one("span")
-            value = ecb.select_one("p")
-            if not label or not value:
-                continue
-            label_text = label.get_text(strip=True).lower()
-            value_text = value.get_text(strip=True)
-
-            if "challan date" in label_text:
-                challan_date = value_text
-            elif "offence" in label_text or "violation" in label_text:
-                offence = value_text
-            elif "location" in label_text or "place" in label_text:
-                location = value_text
-
-        amounts = [amt.get_text(strip=True) for amt in card.select(".challan-amount-content .amount")]
-        amount = amounts[0] if amounts else None
-
-        challans.append({
-            "challan_no": f"Challan {idx}",
-            "number": challan_id,
-            "datetime": challan_date,
-            "amount": amount,
-            "offence": offence,
-            "location": location,
-            "status": status.upper()
-        })
-
-    return {
-        "vehicle": vehicle_number,
-        "vehicle_info": vehicle_info,
-        "total_challans": len(challans),
-        "challans": challans
-    }
-
-# ---------- Async wrapper for sync functions ----------
-def async_handler(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        return asyncio.run(f(*args, **kwargs))
-    return decorated_function
-
-# ---------- Unified DL & Challan Endpoint ----------
-@app.route("/api/search", methods=["GET"])
-@async_handler
-async def unified_search():
-    dl = request.args.get("dl")
-    challan = request.args.get("challan")
-    
-    if dl:
-        try:
-            url = f"https://vahanx.in/dl-search/{dl}"
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(url, headers=HEADERS)
-                if resp.status_code != 200:
-                    return jsonify({"error": "License not found or service unavailable"}), 404
-                data = extract_dl_data(resp.text)
-                if not data["license_number"]:
-                    return jsonify({"error": "License details not found"}), 404
-                return jsonify(data)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-            
-    elif challan:
-        try:
-            url = f"https://vahanx.in/challan-search/{challan}"
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(url, headers=HEADERS)
-                if resp.status_code != 200:
-                    return jsonify({"error": "Vehicle not found or service unavailable"}), 404
-                data = extract_challan_data(resp.text, challan)
-                return jsonify(data)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-            
-    else:
-        return jsonify({"error": "Please provide either ?dl= or ?challan= parameter"}), 400
-
-# ---------- Health Check ----------
 @app.route("/", methods=["GET"])
-def health_check():
+def home():
     return jsonify({
-        "status": "active",
-        "service": "VahanX Data API",
+        "message": "Vehicle Information API",
+        "version": "1.0.0",
         "endpoints": {
-            "/api/vehicle-info?rc=VEHICLE_NUMBER": "Get vehicle RC details",
-            "/api/search?dl=DL_NUMBER": "Get driving license details",
-            "/api/search?challan=VEHICLE_NUMBER": "Get challan details"
+            "/api/vehicle-info?rc=<number>": "Get vehicle RC details with challan info",
+            "/api/challan-info?rc=<number>": "Get only challan information"
         }
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8888, debug=True)
+    app.run(port=8888, debug=False)
